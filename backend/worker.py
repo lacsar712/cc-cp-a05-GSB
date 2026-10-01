@@ -13,7 +13,7 @@ def claim_one(conn):
     with conn.transaction():
         row = conn.execute(
             """
-            SELECT id, probe_id, temp_c
+            SELECT id, probe_id, batch_no, temp_c
             FROM probe_readings
             WHERE status = 'pending'
             ORDER BY id

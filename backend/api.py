@@ -18,6 +18,10 @@ USERS = {
     "watcher": {"role": "reader", "password_hash": pwd.hash("watch123456")},
 }
 
+# 缺冷媒批次号的唯一挡回措辞：网页提交与绕过网页直连接口走同一个 handler，
+# 都返回这一句，两条路径措辞一致，且整笔挡回（不落任何半行数据）。
+BATCH_REQUIRED_DETAIL = "冷媒批次号为报温必填项，缺少批次，整笔退回"
+
 
 def _auth_header(request: web.Request) -> str | None:
     auth = request.headers.get("Authorization", "")
@@ -56,6 +60,28 @@ def require_writer(request: web.Request) -> dict:
     return user
 
 
+def reading_dict(r) -> dict:
+    # 总览、详情、写入响应共用同一序列化器，batch_no 一律取自服务端落库字段
+    return {
+        "id": r["id"],
+        "probe_id": r["probe_id"],
+        "batch_no": r["batch_no"],
+        "temp_c": r["temp_c"],
+        "verdict": r["verdict"],
+        "reason": r["reason"],
+        "status": r["status"],
+        "created_by": r["created_by"],
+        "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        "processed_at": r["processed_at"].isoformat() if r["processed_at"] else None,
+    }
+
+
+READING_COLUMNS = (
+    "id, probe_id, batch_no, temp_c, verdict, reason, status, "
+    "created_by, created_at, processed_at"
+)
+
+
 async def health(_request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "service": "coldchain-probe-desk"})
 
@@ -88,40 +114,94 @@ async def list_readings(request: web.Request) -> web.Response:
     require_user(request)
     pool: asyncpg.Pool = request.app["pool"]
     rows = await pool.fetch(
-        """
-        SELECT id, probe_id, temp_c, verdict, reason, status, created_by, created_at, processed_at
+        f"""
+        SELECT {READING_COLUMNS}
         FROM probe_readings
         ORDER BY id DESC
         """
     )
-    out = []
-    for r in rows:
-        out.append(
+    return web.json_response([reading_dict(r) for r in rows])
+
+
+async def get_reading(request: web.Request) -> web.Response:
+    require_user(request)
+    reading_id = int(request.match_info["id"])
+    pool: asyncpg.Pool = request.app["pool"]
+    row = await pool.fetchrow(
+        f"SELECT {READING_COLUMNS} FROM probe_readings WHERE id = $1",
+        reading_id,
+    )
+    if not row:
+        raise web.HTTPNotFound(
+            text=json.dumps({"detail": "读数不存在"}, ensure_ascii=False),
+            content_type="application/json",
+        )
+    return web.json_response(reading_dict(row))
+
+
+async def list_batch_locks(request: web.Request) -> web.Response:
+    # 锁定清单：服务端从视图 batch_lock_list 取数，batch_no 即 probe_readings 落库列
+    require_user(request)
+    pool: asyncpg.Pool = request.app["pool"]
+    batch_no = request.query.get("batch_no", "").strip()
+    params: list = []
+    where = ""
+    if batch_no:
+        params.append(batch_no)
+        where = "WHERE batch_no = $1"
+    rows = await pool.fetch(
+        f"""
+        SELECT reading_id, probe_id, batch_no, status, created_by, created_at
+        FROM batch_lock_list
+        {where}
+        ORDER BY reading_id DESC
+        """,
+        *params,
+    )
+    return web.json_response(
+        [
             {
-                "id": r["id"],
+                "reading_id": r["reading_id"],
                 "probe_id": r["probe_id"],
-                "temp_c": r["temp_c"],
-                "verdict": r["verdict"],
-                "reason": r["reason"],
+                "batch_no": r["batch_no"],
                 "status": r["status"],
                 "created_by": r["created_by"],
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                "processed_at": r["processed_at"].isoformat() if r["processed_at"] else None,
             }
-        )
-    return web.json_response(out)
+            for r in rows
+        ]
+    )
+
+
+async def read_payload(request: web.Request) -> dict:
+    # 网页发 JSON；绕过网页直连接口可能发 form-urlencoded。
+    # 两种载体都解析成同一个 dict，再走同一套业务校验，保证挡回措辞一致。
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        try:
+            data = await request.post()
+        except Exception:
+            return {}
+        return {k: v for k, v in data.items()}
+    return body if isinstance(body, dict) else {}
 
 
 async def create_reading(request: web.Request) -> web.Response:
     user = require_writer(request)
-    try:
-        body = await request.json()
-    except json.JSONDecodeError as exc:
-        raise web.HTTPBadRequest(text="invalid json") from exc
+    body = await read_payload(request)
     probe_id = str(body.get("probe_id", "")).strip()
     if not probe_id:
         raise web.HTTPBadRequest(
             text=json.dumps({"detail": "探头编号不能为空"}, ensure_ascii=False),
+            content_type="application/json",
+        )
+    # 缺批次（缺字段、null、空串、纯空白）一律整笔挡回。
+    # 网页和绕过网页的直连接口共用此校验，措辞完全一致。
+    batch_no = str(body.get("batch_no", "")).strip()
+    if not batch_no:
+        raise web.HTTPBadRequest(
+            text=json.dumps({"detail": BATCH_REQUIRED_DETAIL}, ensure_ascii=False),
             content_type="application/json",
         )
     try:
@@ -133,31 +213,26 @@ async def create_reading(request: web.Request) -> web.Response:
         ) from exc
 
     pool: asyncpg.Pool = request.app["pool"]
-    row = await pool.fetchrow(
-        """
-        INSERT INTO probe_readings (probe_id, temp_c, status, created_by, created_at)
-        VALUES ($1, $2, 'pending', $3, now())
-        RETURNING id, probe_id, temp_c, verdict, reason, status, created_by, created_at, processed_at
-        """,
-        probe_id,
-        temp_c,
-        user["username"],
-    )
-    return web.json_response(
-        {
-            "id": row["id"],
-            "probe_id": row["probe_id"],
-            "temp_c": row["temp_c"],
-            "verdict": row["verdict"],
-            "reason": row["reason"],
-            "status": row["status"],
-            "created_by": row["created_by"],
-            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-            "processed_at": None,
-            "message": "已入队，后台工人将认领并判定",
-        },
-        status=201,
-    )
+    # 入队（probe_readings）与进入锁定清单（同一行，视图即时可见）原子写入：
+    # 单条 INSERT 单事务，要么整笔成功三处同时可见，要么整笔失败不留半截，
+    # 不存在“先入队后加锁失败、批次还可改”的中间态。
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                f"""
+                INSERT INTO probe_readings
+                    (probe_id, batch_no, temp_c, status, created_by, created_at)
+                VALUES ($1, $2, $3, 'pending', $4, now())
+                RETURNING {READING_COLUMNS}
+                """,
+                probe_id,
+                batch_no,
+                temp_c,
+                user["username"],
+            )
+    payload = reading_dict(row)
+    payload["message"] = "已入队并锁定批次，后台工人将认领并判定"
+    return web.json_response(payload, status=201)
 
 
 async def on_startup(app: web.Application) -> None:
@@ -179,6 +254,8 @@ def create_app() -> web.Application:
     app.router.add_post("/api/auth/login", login)
     app.router.add_get("/api/readings", list_readings)
     app.router.add_post("/api/readings", create_reading)
+    app.router.add_get("/api/readings/{id}", get_reading)
+    app.router.add_get("/api/batch-locks", list_batch_locks)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
