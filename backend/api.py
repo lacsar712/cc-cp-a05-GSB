@@ -13,6 +13,9 @@ from rules import judge_temp
 SECRET = os.environ.get("JWT_SECRET", "coldchain-probe-dev-secret")
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# 缺批次的统一挡回文案：网页提交与绕过网页的直连接口共用同一常量，措辞必须一致。
+BATCH_REQUIRED_DETAIL = "冷媒批次号为报温必填项，请填写冷媒批次后再提交"
+
 USERS = {
     "logger": {"role": "writer", "password_hash": pwd.hash("log123456")},
     "watcher": {"role": "reader", "password_hash": pwd.hash("watch123456")},
@@ -56,6 +59,35 @@ def require_writer(request: web.Request) -> dict:
     return user
 
 
+def _batch_required() -> web.HTTPBadRequest:
+    # 唯一出口：两条路径（网页/直连）都从这里返回，保证同状态码同文案。
+    return web.HTTPBadRequest(
+        text=json.dumps({"detail": BATCH_REQUIRED_DETAIL}, ensure_ascii=False),
+        content_type="application/json",
+    )
+
+
+def reading_dict(r) -> dict:
+    return {
+        "id": r["id"],
+        "probe_id": r["probe_id"],
+        "temp_c": r["temp_c"],
+        "coolant_batch": r["coolant_batch"],
+        "verdict": r["verdict"],
+        "reason": r["reason"],
+        "status": r["status"],
+        "created_by": r["created_by"],
+        "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        "processed_at": r["processed_at"].isoformat() if r["processed_at"] else None,
+    }
+
+
+_READING_COLS = (
+    "id, probe_id, temp_c, coolant_batch, verdict, reason, status, "
+    "created_by, created_at, processed_at"
+)
+
+
 async def health(_request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "service": "coldchain-probe-desk"})
 
@@ -88,27 +120,64 @@ async def list_readings(request: web.Request) -> web.Response:
     require_user(request)
     pool: asyncpg.Pool = request.app["pool"]
     rows = await pool.fetch(
-        """
-        SELECT id, probe_id, temp_c, verdict, reason, status, created_by, created_at, processed_at
+        f"""
+        SELECT {_READING_COLS}
         FROM probe_readings
         ORDER BY id DESC
         """
     )
-    out = []
-    for r in rows:
-        out.append(
-            {
-                "id": r["id"],
-                "probe_id": r["probe_id"],
-                "temp_c": r["temp_c"],
-                "verdict": r["verdict"],
-                "reason": r["reason"],
-                "status": r["status"],
-                "created_by": r["created_by"],
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                "processed_at": r["processed_at"].isoformat() if r["processed_at"] else None,
-            }
+    return web.json_response([reading_dict(r) for r in rows])
+
+
+async def get_reading(request: web.Request) -> web.Response:
+    require_user(request)
+    try:
+        reading_id = int(request.match_info["id"])
+    except ValueError as exc:
+        raise web.HTTPNotFound(text=json.dumps({"detail": "读数不存在"}, ensure_ascii=False),
+                               content_type="application/json") from exc
+    pool: asyncpg.Pool = request.app["pool"]
+    row = await pool.fetchrow(
+        f"SELECT {_READING_COLS} FROM probe_readings WHERE id = $1",
+        reading_id,
+    )
+    if not row:
+        raise web.HTTPNotFound(
+            text=json.dumps({"detail": "读数不存在"}, ensure_ascii=False),
+            content_type="application/json",
         )
+    return web.json_response(reading_dict(row))
+
+
+async def list_batch_locks(request: web.Request) -> web.Response:
+    require_user(request)
+    pool: asyncpg.Pool = request.app["pool"]
+    # 锁定清单展示的批次直接 JOIN 取自 probe_readings.coolant_batch 这一落库字段，
+    # 与总览列/详情列共用同一套值；可选批次筛选（落地页中部输入）。
+    batch_filter = str(request.query.get("coolant_batch", "")).strip()
+    sql = f"""
+        SELECT l.reading_id, l.locked_by, l.locked_at,
+               r.probe_id, r.temp_c, r.status, r.coolant_batch
+        FROM coolant_batch_locks l
+        JOIN probe_readings r ON r.id = l.reading_id
+        {"WHERE r.coolant_batch = $1" if batch_filter else ""}
+        ORDER BY l.reading_id DESC
+    """
+    rows = (
+        await pool.fetch(sql, batch_filter) if batch_filter else await pool.fetch(sql)
+    )
+    out = [
+        {
+            "reading_id": r["reading_id"],
+            "probe_id": r["probe_id"],
+            "temp_c": r["temp_c"],
+            "coolant_batch": r["coolant_batch"],
+            "status": r["status"],
+            "locked_by": r["locked_by"],
+            "locked_at": r["locked_at"].isoformat() if r["locked_at"] else None,
+        }
+        for r in rows
+    ]
     return web.json_response(out)
 
 
@@ -118,6 +187,13 @@ async def create_reading(request: web.Request) -> web.Response:
         body = await request.json()
     except json.JSONDecodeError as exc:
         raise web.HTTPBadRequest(text="invalid json") from exc
+
+    # —— 缺批次整笔挡回：在任何写库之前，网页与直连都走到同一个校验、同一个文案。 ——
+    raw_batch = body.get("coolant_batch")
+    coolant_batch = str(raw_batch).strip() if raw_batch is not None else ""
+    if not coolant_batch:
+        raise _batch_required()
+
     probe_id = str(body.get("probe_id", "")).strip()
     if not probe_id:
         raise web.HTTPBadRequest(
@@ -133,31 +209,37 @@ async def create_reading(request: web.Request) -> web.Response:
         ) from exc
 
     pool: asyncpg.Pool = request.app["pool"]
-    row = await pool.fetchrow(
-        """
-        INSERT INTO probe_readings (probe_id, temp_c, status, created_by, created_at)
-        VALUES ($1, $2, 'pending', $3, now())
-        RETURNING id, probe_id, temp_c, verdict, reason, status, created_by, created_at, processed_at
-        """,
-        probe_id,
-        temp_c,
-        user["username"],
-    )
-    return web.json_response(
-        {
-            "id": row["id"],
-            "probe_id": row["probe_id"],
-            "temp_c": row["temp_c"],
-            "verdict": row["verdict"],
-            "reason": row["reason"],
-            "status": row["status"],
-            "created_by": row["created_by"],
-            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-            "processed_at": None,
-            "message": "已入队，后台工人将认领并判定",
-        },
-        status=201,
-    )
+    # —— 入队与锁定清单原子写入：同一事务，先入队后锁失败会整体回滚，
+    #    绝不留下“可改批次的半截读数”。 ——
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                f"""
+                INSERT INTO probe_readings
+                    (probe_id, temp_c, coolant_batch, status, created_by, created_at)
+                VALUES ($1, $2, $3, 'pending', $4, now())
+                RETURNING {_READING_COLS}
+                """,
+                probe_id,
+                temp_c,
+                coolant_batch,
+                user["username"],
+            )
+            await conn.execute(
+                """
+                INSERT INTO coolant_batch_locks
+                    (reading_id, coolant_batch, locked_by)
+                VALUES ($1, $2, $3)
+                """,
+                row["id"],
+                coolant_batch,
+                user["username"],
+            )
+
+    payload = reading_dict(row)
+    payload["processed_at"] = None
+    payload["message"] = "已入队并锁定冷媒批次，后台工人将认领并判定"
+    return web.json_response(payload, status=201)
 
 
 async def on_startup(app: web.Application) -> None:
@@ -179,6 +261,8 @@ def create_app() -> web.Application:
     app.router.add_post("/api/auth/login", login)
     app.router.add_get("/api/readings", list_readings)
     app.router.add_post("/api/readings", create_reading)
+    app.router.add_get("/api/readings/{id}", get_reading)
+    app.router.add_get("/api/batch-locks", list_batch_locks)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app

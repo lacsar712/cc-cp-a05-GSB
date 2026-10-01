@@ -133,4 +133,56 @@ td {
 .user {
   font-size: 0.875rem;
   color: #475569;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
+
+.nav {
+  display: flex;
+  gap: 0.4rem;
+  margin-right: 0.5rem;
+}
+
+.navbtn {
+  background: #e2e8f0;
+  color: #334155;
+  padding: 0.4rem 0.8rem;
+}
+
+.navbtn.on {
+  background: #0369a1;
+  color: #fff;
+}
+
+tr.clickable {
+  cursor: pointer;
+}
+
+tr.clickable:hover td {
+  background: #f8fafc;
+}
+
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgb(15 23 42 / 45%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+
+.modal {
+  background: #fff;
+  border-radius: 10px;
+  padding: 1.25rem;
+  min-width: 380px;
+  max-width: 90vw;
+  box-shadow: 0 10px 30px rgb(15 23 42 / 25%);
+}
+
+.modal th {
+  width: 40%;
+}
+
